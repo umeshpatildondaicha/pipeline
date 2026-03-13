@@ -156,11 +156,12 @@ def train_and_export(
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-    log.info("Training LSTM (%d epochs, batch=%d)...", N_EPOCHS, BATCH_SIZE)
+    n_batches = len(train_loader)
+    log.info("Training LSTM (%d epochs, batch=%d, %d batches/epoch)...", N_EPOCHS, BATCH_SIZE, n_batches)
     for epoch in range(N_EPOCHS):
         model.train()
         train_loss = 0.0
-        for bx, by in train_loader:
+        for batch_idx, (bx, by) in enumerate(train_loader):
             bx, by = bx.to(device), by.to(device)
             optimizer.zero_grad()
             logits = model(bx)
@@ -168,6 +169,12 @@ def train_and_export(
             loss.backward()
             optimizer.step()
             train_loss += loss.item()
+            if (batch_idx + 1) % max(1, n_batches // 5) == 0 or batch_idx == 0:
+                log.info(
+                    "  Epoch %d/%d  batch %d/%d  loss=%.4f",
+                    epoch + 1, N_EPOCHS, batch_idx + 1, n_batches,
+                    loss.item(),
+                )
         model.eval()
         correct, total = 0, 0
         with torch.no_grad():
