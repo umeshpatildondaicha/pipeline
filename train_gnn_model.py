@@ -66,56 +66,96 @@ def _load_feature_cols() -> list | None:
 
 
 def load_graph_and_features():
-    """Load master_features, topology links, build node index and edge list."""
+    """Load master_features, topology links, build node index and edge list.
+
+    Sampling strategy: when GNN_MAX_NODES < total nodes we prefer nodes that
+    actually appear in the topology link table (connected nodes) so that the
+    sampled subgraph preserves real edges.  Random nodes fill the remainder up
+    to the cap.  This avoids the 0-edge situation that occurs when nodes are
+    sampled uniformly at random from a large node set with a sparse link table.
+    """
     master_path = os.path.join(DATA_DIR, "master_features.pkl")
-    links_path = os.path.join(DATA_DIR, "topology_links.pkl")
-    ne_path = os.path.join(DATA_DIR, "network_elements.pkl")
+    links_path  = os.path.join(DATA_DIR, "topology_links.pkl")
     if not os.path.exists(master_path):
         raise FileNotFoundError(f"Missing {master_path}. Run feature_builder / pipeline first.")
-    master = pd.read_pickle(master_path)
-    ne_df = pd.read_pickle(ne_path) if os.path.exists(ne_path) else master
-    links_df = pd.read_pickle(links_path) if os.path.exists(links_path) else pd.DataFrame(columns=["src", "dst"])
 
-    # Cap node count to avoid O(n²) adjacency matrix blowing up RAM
-    if GNN_MAX_NODES > 0 and len(master) > GNN_MAX_NODES:
-        log.info("Capping GNN nodes: %d → %d (GNN_MAX_NODES=%d)", len(master), GNN_MAX_NODES, GNN_MAX_NODES)
-        master = master.sample(GNN_MAX_NODES, random_state=42).reset_index(drop=True)
+    master   = pd.read_pickle(master_path)
+    links_df = pd.read_pickle(links_path) if os.path.exists(links_path) \
+               else pd.DataFrame(columns=["src", "dst"])
 
-    # Node index: 0 .. n-1 by master row order (ID column)
     if "ID" not in master.columns:
+        master = master.copy()
         master["ID"] = np.arange(len(master))
-    id_to_idx = {int(row["ID"]): i for i, row in master.iterrows()}
-    n_nodes = len(master)
 
-    # Feature matrix — prefer saved feature list from XGBoost training;
-    # fall back to numeric columns in master_features.pkl.
+    # ── Build the full edge set first to know which node IDs are connected
+    src_col = links_df["src"].dropna()
+    dst_col = links_df["dst"].dropna()
+    try:
+        connected_ids = set(src_col.astype(int).tolist()) | set(dst_col.astype(int).tolist())
+    except (TypeError, ValueError):
+        connected_ids = set()
+
+    # ── Cap: prefer connected nodes, fill with random disconnected ones
+    n_total = len(master)
+    if GNN_MAX_NODES > 0 and n_total > GNN_MAX_NODES:
+        master_ids        = master["ID"].astype(int)
+        connected_mask    = master_ids.isin(connected_ids)
+        connected_rows    = master[connected_mask]
+        disconnected_rows = master[~connected_mask]
+        n_connected       = len(connected_rows)
+
+        if n_connected >= GNN_MAX_NODES:
+            master  = connected_rows.sample(GNN_MAX_NODES, random_state=GNN_RANDOM_STATE)
+            n_fill  = 0
+        else:
+            n_fill = GNN_MAX_NODES - n_connected
+            fill   = disconnected_rows.sample(
+                min(n_fill, len(disconnected_rows)), random_state=GNN_RANDOM_STATE
+            )
+            master = pd.concat([connected_rows, fill], ignore_index=True)
+
+        log.info(
+            "Capping GNN nodes: %d → %d  (%d connected kept, %d random added)  GNN_MAX_NODES=%d",
+            n_total, len(master), min(n_connected, GNN_MAX_NODES), n_fill, GNN_MAX_NODES,
+        )
+    else:
+        master = master.copy()
+
+    master = master.reset_index(drop=True)
+
+    # ── Vectorized id_to_idx (fast even for 50k+ nodes)
+    ids       = master["ID"].astype(int).values
+    id_to_idx = dict(zip(ids.tolist(), range(len(ids))))
+    n_nodes   = len(master)
+
+    # ── Feature matrix — prefer XGBoost feature list; fall back to numeric cols
     saved_cols = _load_feature_cols()
     if saved_cols:
         use_cols = [c for c in saved_cols if c in master.columns]
     else:
         use_cols = []
     if len(use_cols) < 5:
-        use_cols = [c for c in master.select_dtypes(include=[np.number]).columns if c != "ID"][:40]
-    X = master[use_cols].fillna(0).astype(np.float32).values
-    # Normalize
-    X = (X - X.mean(axis=0)) / (X.std(axis=0) + 1e-6)
+        use_cols = [c for c in master.select_dtypes(include=[np.number]).columns
+                    if c != "ID"][:40]
 
-    # Edge index (bidirectional)
-    edge_list = []
-    for _, row in links_df.iterrows():
-        s, d = row.get("src"), row.get("dst")
-        if pd.isna(s) or pd.isna(d):
-            continue
-        try:
-            si, di = id_to_idx.get(int(s)), id_to_idx.get(int(d))
-            if si is not None and di is not None and si != di:
-                edge_list.append((si, di))
-                edge_list.append((di, si))
-        except (TypeError, ValueError):
-            continue
-    edge_list = list(set(edge_list))
+    X = master[use_cols].fillna(0).astype(np.float32).values
+    X = (X - X.mean(axis=0)) / (X.std(axis=0) + 1e-6)   # normalize
+
+    # ── Edge index (bidirectional) — vectorized
+    s_ids = pd.to_numeric(links_df["src"], errors="coerce").dropna().astype(int)
+    d_ids = pd.to_numeric(links_df["dst"], errors="coerce").dropna().astype(int)
+    valid  = s_ids.index.intersection(d_ids.index)
+    s_idx  = s_ids[valid].map(id_to_idx)
+    d_idx  = d_ids[valid].map(id_to_idx)
+    mask   = s_idx.notna() & d_idx.notna() & (s_idx != d_idx)
+    fwd    = list(zip(s_idx[mask].astype(int).tolist(), d_idx[mask].astype(int).tolist()))
+    bwd    = [(d, s) for s, d in fwd]
+    edge_list = list(set(fwd + bwd))
+
     if not edge_list:
-        log.warning("No edges in topology — GNN will behave like MLP on nodes.")
+        log.warning("No edges survived in sampled subgraph — GNN will behave like MLP.")
+    else:
+        log.info("GNN edges in subgraph: %d (bidirectional pairs)", len(edge_list) // 2)
 
     return {
         "X": X,
@@ -277,14 +317,15 @@ def train_and_save(data: dict, y: np.ndarray, label_list: list):
 
     config_path = os.path.join(MODELS_DIR, "gnn_config.json")
     with open(config_path, "w") as f:
+        # compact JSON: id_to_idx and edge_list can be large — skip pretty-printing
         json.dump({
-            "id_to_idx": {str(k): v for k, v in data["id_to_idx"].items()},
+            "id_to_idx":    {str(k): v for k, v in data["id_to_idx"].items()},
             "feature_cols": data["feature_cols"],
-            "label_list": label_list,
-            "n_nodes": n_nodes,
-            "edge_list": data["edge_list"],
-        }, f, indent=2)
-    log.info(f"Saved config: {config_path}")
+            "label_list":   label_list,
+            "n_nodes":      n_nodes,
+            "edge_list":    data["edge_list"],
+        }, f, separators=(",", ":"))
+    log.info("Saved config: %s  (%d KB)", config_path, os.path.getsize(config_path) // 1024)
 
     labels_path = os.path.join(MODELS_DIR, "gnn_labels.json")
     with open(labels_path, "w") as f:
@@ -293,13 +334,19 @@ def train_and_save(data: dict, y: np.ndarray, label_list: list):
 
 
 def run():
-    label_list = _load_root_cause_labels()
-    data = load_graph_and_features()
+    label_list  = _load_root_cause_labels()
+    log.info("GNN labels: %s", label_list)
+    data        = load_graph_and_features()
     alarms_path = os.path.join(DATA_DIR, "alarms_raw.pkl")
-    ne_path = os.path.join(DATA_DIR, "network_elements.pkl")
-    ne_df = pd.read_pickle(ne_path) if os.path.exists(ne_path) else data.get("master", pd.DataFrame())
+    ne_path     = os.path.join(DATA_DIR, "network_elements.pkl")
+    ne_df       = pd.read_pickle(ne_path) if os.path.exists(ne_path) \
+                  else data.get("master", pd.DataFrame())
     y = build_node_labels(alarms_path, data["id_to_idx"], ne_df, label_list)
-    log.info(f"GNN: {data['n_nodes']} nodes, {len(data['edge_list'])} edges, {len(data['feature_cols'])} features, {len(label_list)} classes")
+    log.info(
+        "GNN: %d nodes, %d edges, %d features, %d classes",
+        data["n_nodes"], len(data["edge_list"]),
+        len(data["feature_cols"]), len(label_list),
+    )
     train_and_save(data, y, label_list)
 
 
