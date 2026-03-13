@@ -165,7 +165,7 @@ def retrain_models(changes: dict, engine) -> list:
         retrained.append("root_cause_classifier.onnx")
         log.info(f"  Root Cause Classifier: accuracy={rc_results['accuracy']:.3f}")
 
-    if changes["new_alarms"] > 100:
+    if changes["new_alarms"] > RETRAIN_NEW_ALARM_THRESHOLD:
         log.info("Retraining Propagation model (new alarms)...")
 
         import pandas as pd

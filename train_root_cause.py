@@ -297,6 +297,8 @@ def _generate_synthetic_training_data(master_df: pd.DataFrame,
              f"(label set: {label_list})...")
 
     df = master_df.sample(n=n_samples, replace=True).reset_index(drop=True)
+    # Replace pd.NA/NaN with 0 before row iteration to avoid "boolean value of NA is ambiguous"
+    df = df.fillna(0)
 
     root_causes = []
     for _, row in df.iterrows():
