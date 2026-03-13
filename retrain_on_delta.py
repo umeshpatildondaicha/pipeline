@@ -24,7 +24,9 @@ sys.path.insert(0, PIPELINE_DIR)
 
 from config import (
     configure_logging, get_engine,
-    OUTPUT_DIR, MODELS_DIR, STAGING_DIR, DEPLOY_DIR, BACKUP_DIR, STATE_FILE
+    OUTPUT_DIR, MODELS_DIR, STAGING_DIR, DEPLOY_DIR, BACKUP_DIR, STATE_FILE,
+    RETRAIN_NEW_ALARM_THRESHOLD, RETRAIN_MODEL_SIZE_MIN_RATIO,
+    RETRAIN_ACCURACY_TOLERANCE,
 )
 
 log = configure_logging("retrain_on_delta")
@@ -67,46 +69,47 @@ def detect_changes(engine, state: dict) -> tuple:
     try:
         from sqlalchemy import text
 
-        # NE count + ID sum fingerprint
-        row = engine.execute(text("""
-            SELECT COUNT(*) as cnt, SUM(ID) as id_sum
-            FROM NETWORK_ELEMENT
-            WHERE IS_DELETED = 0 AND DELETED = 0
-        """)).fetchone()
-        ne_hash = hashlib.md5(f"{row['cnt']}{row['id_sum']}".encode()).hexdigest()
-        if ne_hash != state.get("ne_count_hash"):
-            changes["ne_changed"] = True
-            log.info(f"  NE changes detected: {row['cnt']:,} elements")
-        state["ne_count_hash"] = ne_hash
+        with engine.connect() as conn:
+            # NE count + ID sum fingerprint
+            row = conn.execute(text("""
+                SELECT COUNT(*) as cnt, SUM(ID) as id_sum
+                FROM NETWORK_ELEMENT
+                WHERE IS_DELETED = 0
+            """)).fetchone()
+            ne_hash = hashlib.md5(f"{row[0]}{row[1]}".encode()).hexdigest()
+            if ne_hash != state.get("ne_count_hash"):
+                changes["ne_changed"] = True
+                log.info(f"  NE changes detected: {row[0]:,} elements")
+            state["ne_count_hash"] = ne_hash
 
-        # Total link count fingerprint
-        link_total = engine.execute(text("""
-            SELECT
-              (SELECT COUNT(*) FROM BGP_LINK     WHERE IS_DELETED=0) +
-              (SELECT COUNT(*) FROM LLDP_LINK    WHERE IS_DELETED=0) +
-              (SELECT COUNT(*) FROM OSPF_LINK    WHERE IS_DELETED=0) +
-              (SELECT COUNT(*) FROM ISIS_LINK    WHERE IS_DELETED=0) +
-              (SELECT COUNT(*) FROM PHYSICAL_LINK) as total
-        """)).fetchone()["total"]
-        link_hash = hashlib.md5(str(link_total).encode()).hexdigest()
-        if link_hash != state.get("link_count_hash"):
-            changes["links_changed"] = True
-            log.info(f"  Link changes detected: {link_total:,} links")
-        state["link_count_hash"] = link_hash
+            # Total link count fingerprint
+            link_total = conn.execute(text("""
+                SELECT
+                  (SELECT COUNT(*) FROM BGP_LINK     WHERE IS_DELETED=0) +
+                  (SELECT COUNT(*) FROM LLDP_LINK    WHERE IS_DELETED=0) +
+                  (SELECT COUNT(*) FROM OSPF_LINK    WHERE IS_DELETED=0) +
+                  (SELECT COUNT(*) FROM ISIS_LINK    WHERE IS_DELETED=0) +
+                  (SELECT COUNT(*) FROM PHYSICAL_LINK) as total
+            """)).scalar()
+            link_hash = hashlib.md5(str(link_total).encode()).hexdigest()
+            if link_hash != state.get("link_count_hash"):
+                changes["links_changed"] = True
+                log.info(f"  Link changes detected: {link_total:,} links")
+            state["link_count_hash"] = link_hash
 
-        # New alarms since last run
-        from alarm_config import load_alarm_schema
-        schema   = load_alarm_schema()
-        ts_col   = schema.get("timestamp", "ALARM_TIME")
-        tbl      = schema.get("table", "ALARM")
-        last_run = state.get("last_run")
-        if last_run:
-            row2 = engine.execute(
-                text(f"SELECT COUNT(*) as cnt FROM {tbl} WHERE {ts_col} > :lr"),
-                {"lr": last_run}
-            ).fetchone()
-            changes["new_alarms"] = int(row2["cnt"]) if row2 else 0
-            log.info(f"  New alarms since last run: {changes['new_alarms']:,}")
+            # New alarms since last run — use bind parameter (no injection risk)
+            from alarm_config import load_alarm_schema
+            schema   = load_alarm_schema()
+            ts_col   = schema.get("timestamp", "ALARM_TIME")
+            tbl      = schema.get("table", "ALARM")
+            last_run = state.get("last_run")
+            if last_run:
+                count = conn.execute(
+                    text(f"SELECT COUNT(*) FROM {tbl} WHERE {ts_col} > :lr"),
+                    {"lr": last_run}
+                ).scalar()
+                changes["new_alarms"] = int(count) if count else 0
+                log.info(f"  New alarms since last run: {changes['new_alarms']:,}")
 
     except Exception as e:
         log.error(f"  Change detection failed: {e}")
@@ -116,7 +119,7 @@ def detect_changes(engine, state: dict) -> tuple:
     changes["retrain_needed"] = (
         changes["ne_changed"] or
         changes["links_changed"] or
-        changes["new_alarms"] > 100
+        changes["new_alarms"] > RETRAIN_NEW_ALARM_THRESHOLD
     )
     return changes, state
 
@@ -152,8 +155,12 @@ def retrain_models(changes: dict, engine) -> list:
         rc_results  = train_root_cause_classifier(training_df)
         export_to_onnx(rc_results["model"], rc_results["features"], rc_results["n_classes"])
 
-        # Save accuracy for validation comparison
-        _save_score("new_accuracy", rc_results["accuracy"])
+        # Save overall accuracy + per-class F1 for validation comparison
+        per_class_f1 = {
+            cls: rc_results["report"].get(cls, {}).get("f1-score", 0.0)
+            for cls in rc_results["label_encoder"].classes_
+        }
+        _save_score("new_accuracy", rc_results["accuracy"], per_class_f1=per_class_f1)
 
         retrained.append("root_cause_classifier.onnx")
         log.info(f"  Root Cause Classifier: accuracy={rc_results['accuracy']:.3f}")
@@ -178,6 +185,15 @@ def retrain_models(changes: dict, engine) -> list:
 # VALIDATION — new model must be as good as current
 # ─────────────────────────────────────────────────────────────
 def validate_new_model(model_file: str) -> dict:
+    """Validate a newly trained model before promoting it to deploy/.
+
+    Checks:
+    1. Staging file exists.
+    2. File size is at least RETRAIN_MODEL_SIZE_MIN_RATIO of the deployed size
+       (guards against a corrupt / truncated export).
+    3. Overall accuracy has not dropped more than RETRAIN_ACCURACY_TOLERANCE.
+    4. Per-class F1 scores are logged so operators can spot class-level regressions.
+    """
     staging_path = os.path.join(STAGING_DIR, model_file)
     deploy_path  = os.path.join(DEPLOY_DIR,  model_file)
 
@@ -187,32 +203,54 @@ def validate_new_model(model_file: str) -> dict:
     if not os.path.exists(deploy_path):
         return {"valid": True, "reason": "First deployment"}
 
-    # Size sanity: new model must be at least 50% of current size
+    # ── Size sanity check
     new_size     = os.path.getsize(staging_path)
     current_size = os.path.getsize(deploy_path)
-    if new_size < current_size * 0.5:
+    if new_size < current_size * RETRAIN_MODEL_SIZE_MIN_RATIO:
         return {
             "valid": False,
-            "reason": f"New model too small ({new_size} vs {current_size} bytes)"
+            "reason": (
+                f"New model too small: {new_size:,} bytes vs "
+                f"{current_size:,} bytes (threshold={RETRAIN_MODEL_SIZE_MIN_RATIO:.0%})"
+            ),
         }
 
-    # Accuracy check (if scores available)
+    # ── Accuracy + per-class metric check (if scores file available)
     score_path = os.path.join(MODELS_DIR, "model_scores.json")
     if os.path.exists(score_path):
         with open(score_path) as f:
             scores = json.load(f)
-        new_acc  = scores.get("new_accuracy", 0)
-        curr_acc = scores.get("current_accuracy", 0)
-        if new_acc < curr_acc - 0.02:   # 2% tolerance
+
+        new_acc  = scores.get("new_accuracy",     0.0)
+        curr_acc = scores.get("current_accuracy", 0.0)
+
+        if curr_acc > 0 and new_acc < curr_acc - RETRAIN_ACCURACY_TOLERANCE:
             return {
                 "valid": False,
-                "reason": f"Accuracy dropped: {curr_acc:.3f} → {new_acc:.3f}"
+                "reason": (
+                    f"Overall accuracy dropped beyond tolerance: "
+                    f"{curr_acc:.3f} → {new_acc:.3f} "
+                    f"(tolerance={RETRAIN_ACCURACY_TOLERANCE})"
+                ),
             }
+
+        # Log per-class F1 regression if available
+        new_per_class  = scores.get("new_per_class_f1",     {})
+        curr_per_class = scores.get("current_per_class_f1", {})
+        if new_per_class and curr_per_class:
+            for cls, new_f1 in new_per_class.items():
+                old_f1 = curr_per_class.get(cls, new_f1)
+                if new_f1 < old_f1 - RETRAIN_ACCURACY_TOLERANCE:
+                    log.warning(
+                        "  Per-class F1 regression — class '%s': %.3f → %.3f",
+                        cls, old_f1, new_f1,
+                    )
 
     return {"valid": True, "reason": "Passed validation"}
 
 
-def _save_score(key: str, value: float):
+def _save_score(key: str, value, per_class_f1: dict = None):
+    """Persist model scores (overall + per-class) to model_scores.json."""
     score_path = os.path.join(MODELS_DIR, "model_scores.json")
     scores = {}
     if os.path.exists(score_path):
@@ -220,8 +258,11 @@ def _save_score(key: str, value: float):
             scores = json.load(f)
 
     if key == "new_accuracy":
-        scores["current_accuracy"] = scores.get("new_accuracy", value)
-        scores["new_accuracy"]     = value
+        scores["current_accuracy"]     = scores.get("new_accuracy", value)
+        scores["new_accuracy"]         = value
+        if per_class_f1:
+            scores["current_per_class_f1"] = scores.get("new_per_class_f1", per_class_f1)
+            scores["new_per_class_f1"]     = per_class_f1
 
     with open(score_path, "w") as f:
         json.dump(scores, f, indent=2)
@@ -231,14 +272,20 @@ def _save_score(key: str, value: float):
 # HOT-SWAP — atomic model file replacement
 # ─────────────────────────────────────────────────────────────
 def hot_swap_model(model_file: str, version: int):
+    """Atomically replace the deployed model file and update manifest.json.
+
+    The previous file is always backed up before replacement so that
+    rollback_model() can restore it if inference fails after the swap.
+    """
     staging_path = os.path.join(STAGING_DIR, model_file)
     deploy_path  = os.path.join(DEPLOY_DIR,  model_file)
     backup_path  = os.path.join(BACKUP_DIR,  f"v{version}_{model_file}")
 
     if os.path.exists(deploy_path):
         shutil.copy2(deploy_path, backup_path)
+        log.info(f"  Backed up current model to {backup_path}")
 
-    # Atomic replace (same filesystem)
+    # os.replace is atomic on POSIX (same filesystem required)
     shutil.copy2(staging_path, deploy_path + ".tmp")
     os.replace(deploy_path + ".tmp", deploy_path)
     log.info(f"  Hot-swapped: {model_file} (v{version})")
@@ -258,6 +305,35 @@ def hot_swap_model(model_file: str, version: int):
         manifest = existing
     with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
+
+
+def rollback_model(model_file: str, version: int) -> bool:
+    """Restore the backup taken before the last hot-swap.
+
+    Returns True if the rollback succeeded, False if no backup was found.
+    """
+    backup_path = os.path.join(BACKUP_DIR, f"v{version}_{model_file}")
+    deploy_path = os.path.join(DEPLOY_DIR, model_file)
+
+    if not os.path.exists(backup_path):
+        log.error(f"  Rollback failed: no backup found at {backup_path}")
+        return False
+
+    shutil.copy2(backup_path, deploy_path + ".tmp")
+    os.replace(deploy_path + ".tmp", deploy_path)
+    log.warning(f"  Rolled back {model_file} to v{version} backup")
+
+    # Rewrite manifest to signal Spring Boot to reload
+    manifest_path = os.path.join(DEPLOY_DIR, "manifest.json")
+    if os.path.exists(manifest_path):
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+        manifest["version"]     = int(manifest.get("version", version)) - 1
+        manifest["deployed_at"] = datetime.now().isoformat()
+        manifest["rolled_back"] = True
+        with open(manifest_path, "w") as f:
+            json.dump(manifest, f, indent=2)
+    return True
 
 
 # ─────────────────────────────────────────────────────────────
@@ -296,11 +372,20 @@ def run_incremental_retrain():
             shutil.copy2(src, dst)
 
         validation = validate_new_model(model_file)
-        if validation["valid"]:
+        if not validation["valid"]:
+            log.warning(f"  Skipped {model_file}: {validation['reason']}")
+            continue
+
+        try:
             hot_swap_model(model_file, version)
             deployed.append(model_file)
-        else:
-            log.warning(f"  Skipped {model_file}: {validation['reason']}")
+        except Exception as exc:
+            log.error(f"  Hot-swap failed for {model_file}: {exc}")
+            log.warning("  Attempting rollback to previous version...")
+            if rollback_model(model_file, version):
+                log.info(f"  Rollback successful for {model_file}")
+            else:
+                log.error(f"  Rollback FAILED for {model_file} — manual intervention required")
 
     state["last_run"]      = datetime.now().isoformat()
     state["model_version"] = version if deployed else state.get("model_version", 0)

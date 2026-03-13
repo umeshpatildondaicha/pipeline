@@ -17,18 +17,22 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np
 import pandas as pd
 
-from config import configure_logging, OUTPUT_DIR, MODELS_DIR, DEPLOY_DIR
+from config import (
+    configure_logging, OUTPUT_DIR, MODELS_DIR, DEPLOY_DIR,
+    SEQ_MAX_LEN, SEQ_EMBED_DIM, SEQ_HIDDEN_SIZE, SEQ_BATCH_SIZE,
+    SEQ_VALID_FRAC, SEQ_N_EPOCHS, XGB_RANDOM_STATE,
+)
 
 log = configure_logging("train_sequence_model")
 
 DATA_DIR = OUTPUT_DIR
-MAX_SEQ_LEN = 20
-EMBED_DIM = 32
-HIDDEN_SIZE = 128
-N_EPOCHS = int(os.getenv("SEQUENCE_EPOCHS", "5"))
-BATCH_SIZE = 256
-VALID_FRAC = 0.15
-RANDOM_STATE = 42
+MAX_SEQ_LEN  = SEQ_MAX_LEN
+EMBED_DIM    = SEQ_EMBED_DIM
+HIDDEN_SIZE  = SEQ_HIDDEN_SIZE
+N_EPOCHS     = SEQ_N_EPOCHS
+BATCH_SIZE   = SEQ_BATCH_SIZE
+VALID_FRAC   = SEQ_VALID_FRAC
+RANDOM_STATE = XGB_RANDOM_STATE
 
 # PAD=0, UNK=1, then alarm codes
 PAD_IDX = 0
@@ -43,16 +47,19 @@ def _load_incidents():
 
 
 def _load_root_cause_labels():
-    path = os.path.join(MODELS_DIR, "root_cause_labels.json")
-    if not os.path.exists(path):
-        # Fallback to plan's 9 classes
-        return [
-            "BACKHAUL_ISSUE", "CONFIGURATION_ERROR", "HARDWARE_FAILURE",
-            "INTERFACE_ERROR", "LATENCY_HIGH", "LINK_CONGESTION",
-            "PACKET_LOSS", "POWER_ISSUE", "UNKNOWN",
-        ]
-    with open(path) as f:
-        return json.load(f)
+    """Load root cause labels from the canonical JSON written by train_root_cause.py."""
+    from config import load_root_cause_labels
+    try:
+        return load_root_cause_labels()
+    except FileNotFoundError as exc:
+        log.warning(
+            "%s  — run train_root_cause.py (or run_pipeline.py --mode full) first "
+            "to generate root_cause_labels.json from real data.",
+            exc,
+        )
+        # Return an empty list so the caller fails clearly rather than silently
+        # using a stale hardcoded set.
+        raise
 
 
 def build_vocab(incidents_df: pd.DataFrame):

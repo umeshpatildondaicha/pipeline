@@ -20,15 +20,18 @@ import numpy as np
 import pandas as pd
 import torch
 
-from config import configure_logging, OUTPUT_DIR, MODELS_DIR
+from config import (
+    configure_logging, OUTPUT_DIR, MODELS_DIR,
+    GNN_HIDDEN_DIM, GNN_N_EPOCHS, GNN_BATCH_SIZE, GNN_VAL_FRAC, GNN_RANDOM_STATE,
+)
 
 log = configure_logging("train_gnn_model")
 
-DATA_DIR = OUTPUT_DIR
-HIDDEN_DIM = 64
-N_EPOCHS = int(os.getenv("GNN_EPOCHS", "25"))
-BATCH_SIZE = 256
-RANDOM_STATE = 42
+DATA_DIR     = OUTPUT_DIR
+HIDDEN_DIM   = GNN_HIDDEN_DIM
+N_EPOCHS     = GNN_N_EPOCHS
+BATCH_SIZE   = GNN_BATCH_SIZE
+RANDOM_STATE = GNN_RANDOM_STATE
 
 def _load_root_cause_labels() -> list:
     """
@@ -181,36 +184,69 @@ class GCN(torch.nn.Module):
 
 
 def train_and_save(data: dict, y: np.ndarray, label_list: list):
-    """Train 2-layer GCN and save state_dict + config."""
+    """Train 2-layer GCN and save state_dict + config.
+
+    A random node-level train/val split is created so that the reported
+    accuracy is on held-out nodes, not the training set.
+    """
     X = data["X"]
     edge_list = data["edge_list"]
     n_nodes = data["n_nodes"]
+
+    # ── Train / validation split (node-level mask)
+    rng = np.random.default_rng(RANDOM_STATE)
+    idx = np.arange(n_nodes)
+    rng.shuffle(idx)
+    n_val   = max(1, int(n_nodes * GNN_VAL_FRAC))
+    val_idx   = idx[:n_val]
+    train_idx = idx[n_val:]
+    train_mask = torch.zeros(n_nodes, dtype=torch.bool)
+    val_mask   = torch.zeros(n_nodes, dtype=torch.bool)
+    train_mask[train_idx] = True
+    val_mask[val_idx]     = True
+    log.info(f"GNN split: {train_mask.sum()} train nodes, {val_mask.sum()} val nodes")
+
     adj = build_adjacency(n_nodes, edge_list)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    x_t = torch.from_numpy(X).to(device)
-    adj = adj.to(device)
-    y_t = torch.from_numpy(y).long().to(device)
+    x_t   = torch.from_numpy(X).to(device)
+    adj   = adj.to(device)
+    y_t   = torch.from_numpy(y).long().to(device)
+    train_mask = train_mask.to(device)
+    val_mask   = val_mask.to(device)
+
     n_classes = len(label_list)
-    in_dim = X.shape[1]
-    model = GCN(in_dim, HIDDEN_DIM, n_classes).to(device)
+    in_dim    = X.shape[1]
+    model     = GCN(in_dim, HIDDEN_DIM, n_classes).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+
+    best_val_acc = 0.0
     model.train()
     for epoch in range(N_EPOCHS):
         optimizer.zero_grad()
         logits = model(x_t, adj)
-        loss = torch.nn.functional.cross_entropy(logits, y_t)
+        # Loss computed on training nodes only
+        loss = torch.nn.functional.cross_entropy(logits[train_mask], y_t[train_mask])
         loss.backward()
         optimizer.step()
-        pred = logits.argmax(dim=1)
-        acc = (pred == y_t).float().mean().item()
+
         if (epoch + 1) % 5 == 0 or epoch == 0:
-            log.info(f"Epoch {epoch+1}/{N_EPOCHS} loss={loss.item():.4f} acc={acc:.4f}")
+            model.eval()
+            with torch.no_grad():
+                all_logits = model(x_t, adj)
+                train_acc = (all_logits[train_mask].argmax(dim=1) == y_t[train_mask]).float().mean().item()
+                val_acc   = (all_logits[val_mask].argmax(dim=1)   == y_t[val_mask]).float().mean().item()
+                best_val_acc = max(best_val_acc, val_acc)
+            log.info(
+                f"Epoch {epoch+1}/{N_EPOCHS} loss={loss.item():.4f} "
+                f"train_acc={train_acc:.4f} val_acc={val_acc:.4f}"
+            )
+            model.train()
+
     model.eval()
     with torch.no_grad():
         logits = model(x_t, adj)
-        pred = logits.argmax(dim=1).cpu().numpy()
-        acc = (pred == y).mean()
-    log.info(f"Final node-level accuracy: {acc:.4f}")
+        val_acc = (logits[val_mask].argmax(dim=1) == y_t[val_mask]).float().mean().item()
+    log.info(f"Final validation accuracy: {val_acc:.4f}  (best={best_val_acc:.4f})")
 
     # Save
     os.makedirs(MODELS_DIR, exist_ok=True)

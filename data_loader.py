@@ -372,12 +372,12 @@ def load_alarms(engine, since_timestamp: str = None) -> pd.DataFrame:
     """
     log.info("Loading alarm events...")
 
-    schema = detect_alarm_columns(engine)
-    query  = get_alarm_query(schema, since_timestamp=since_timestamp)
+    schema     = detect_alarm_columns(engine)
+    query, params = get_alarm_query(schema, since_timestamp=since_timestamp)
 
     try:
         chunks = []
-        for chunk in pd.read_sql(query, engine, chunksize=CHUNK_SIZE):
+        for chunk in pd.read_sql(query, engine, params=params or None, chunksize=CHUNK_SIZE):
             chunks.append(chunk)
             if len(chunks) % 10 == 0:
                 log.info(f"  Loaded {len(chunks) * CHUNK_SIZE:,}+ rows...")

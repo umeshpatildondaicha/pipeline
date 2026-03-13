@@ -3,6 +3,29 @@ config.py — Single source of truth for all pipeline settings.
 
 All other scripts import from here. DB credentials, paths, and
 alarm column names are all configured via .env (or environment variables).
+
+Environment variable reference (all optional unless marked REQUIRED):
+  DB_HOST, DB_PORT, DB_USER, DB_PASSWORD (REQUIRED), DB_NAME
+  ALARM_TABLE, ALARM_NE_ID_COL, ALARM_CODE_COL, ALARM_SEVERITY_COL,
+  ALARM_TIMESTAMP_COL, ALARM_ROOT_CAUSE_COL, ALARM_STATUS_COL,
+  ALARM_CLEAR_TIME_COL
+  OUTPUT_DIR, MODELS_DIR, DEPLOY_DIR, CHUNK_SIZE, LOG_LEVEL
+  CORRELATION_WINDOW_MINUTES, BETWEENNESS_SAMPLE_K, MAX_HIERARCHY_DEPTH
+  TOPO_LAYER_THRESHOLDS (e.g. "1,5,15")
+  LINK_HEALTH_UTILIZATION_WEIGHT, LINK_HEALTH_ERROR_WEIGHT,
+  LINK_HEALTH_DROP_WEIGHT, LINK_HEALTH_CRITICAL_WEIGHT
+  XGB_N_ESTIMATORS, XGB_MAX_DEPTH, XGB_LEARNING_RATE, XGB_SUBSAMPLE,
+  XGB_COLSAMPLE_BYTREE, XGB_MIN_CHILD_WEIGHT, XGB_EARLY_STOPPING_ROUNDS,
+  XGB_RANDOM_STATE
+  SEQ_MAX_LEN, SEQ_EMBED_DIM, SEQ_HIDDEN_SIZE, SEQ_BATCH_SIZE,
+  SEQ_VALID_FRAC, SEQUENCE_EPOCHS
+  GNN_HIDDEN_DIM, GNN_BATCH_SIZE, GNN_VAL_FRAC, GNN_RANDOM_STATE,
+  GNN_EPOCHS
+  ANOMALY_N_ESTIMATORS, ANOMALY_SYNTHETIC_NES, ANOMALY_SYNTHETIC_HOURS,
+  ANOMALY_INJECTION_RATE
+  RETRAIN_NEW_ALARM_THRESHOLD, RETRAIN_MODEL_SIZE_MIN_RATIO,
+  RETRAIN_ACCURACY_TOLERANCE
+  SYNTHETIC_N_SAMPLES, SYNTHETIC_MIN_SAMPLES
 """
 
 import os
@@ -20,9 +43,19 @@ DB_CONFIG = {
     "host":     os.getenv("DB_HOST",     "localhost"),
     "port":     int(os.getenv("DB_PORT", "3306")),
     "user":     os.getenv("DB_USER",     "root"),
-    "password": os.getenv("DB_PASSWORD", "root"),
+    "password": os.getenv("DB_PASSWORD", ""),
     "database": os.getenv("DB_NAME",     "railtel"),
 }
+
+# Warn loudly if credentials look like they were never changed from defaults.
+if DB_CONFIG["user"] == "root" and DB_CONFIG["password"] in ("", "root"):
+    import warnings
+    warnings.warn(
+        "DB credentials appear to be default/empty. "
+        "Set DB_USER and DB_PASSWORD in .env before connecting to a real database.",
+        UserWarning,
+        stacklevel=2,
+    )
 
 # ─────────────────────────────────────────────────────────────
 # ALARM TABLE — column names in your real database
@@ -59,6 +92,92 @@ CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "50000"))
 # LOGGING
 # ─────────────────────────────────────────────────────────────
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+
+# ─────────────────────────────────────────────────────────────
+# ALARM CORRELATION
+# ─────────────────────────────────────────────────────────────
+CORRELATION_WINDOW_MINUTES = int(os.getenv("CORRELATION_WINDOW_MINUTES", "30"))
+
+# ─────────────────────────────────────────────────────────────
+# FEATURE ENGINEERING
+# ─────────────────────────────────────────────────────────────
+# Number of nodes to sample when computing betweenness centrality (approx.)
+BETWEENNESS_SAMPLE_K = int(os.getenv("BETWEENNESS_SAMPLE_K", "500"))
+
+# Maximum parent-chain depth to traverse before aborting (cycle guard)
+MAX_HIERARCHY_DEPTH = int(os.getenv("MAX_HIERARCHY_DEPTH", "20"))
+
+# Degree thresholds for TOPO_LAYER: [isolated→access, access→aggregation, aggregation→core]
+TOPO_LAYER_THRESHOLDS = [
+    int(x) for x in os.getenv("TOPO_LAYER_THRESHOLDS", "1,5,15").split(",")
+]
+
+# Weights for the ISIS combined link-health score.
+# All four components are normalised to a 0–1 scale before weighting so
+# that the score itself is also in the 0–1 range.
+#   utilization  : 0–100 % → divide by 100
+#   error_rate   : 0–1   (fraction) → already 0–1
+#   drop_rate    : 0–1   (fraction) → already 0–1
+#   critical_links: count → divide by SRC_LINK_COUNT
+LINK_HEALTH_UTILIZATION_WEIGHT = float(os.getenv("LINK_HEALTH_UTILIZATION_WEIGHT", "0.4"))
+LINK_HEALTH_ERROR_WEIGHT       = float(os.getenv("LINK_HEALTH_ERROR_WEIGHT",       "0.3"))
+LINK_HEALTH_DROP_WEIGHT        = float(os.getenv("LINK_HEALTH_DROP_WEIGHT",        "0.2"))
+LINK_HEALTH_CRITICAL_WEIGHT    = float(os.getenv("LINK_HEALTH_CRITICAL_WEIGHT",    "0.1"))
+
+# ─────────────────────────────────────────────────────────────
+# XGBOOST HYPERPARAMETERS (root cause classifier)
+# ─────────────────────────────────────────────────────────────
+XGB_N_ESTIMATORS         = int(os.getenv("XGB_N_ESTIMATORS",          "300"))
+XGB_MAX_DEPTH            = int(os.getenv("XGB_MAX_DEPTH",              "8"))
+XGB_LEARNING_RATE        = float(os.getenv("XGB_LEARNING_RATE",        "0.05"))
+XGB_SUBSAMPLE            = float(os.getenv("XGB_SUBSAMPLE",            "0.8"))
+XGB_COLSAMPLE_BYTREE     = float(os.getenv("XGB_COLSAMPLE_BYTREE",     "0.8"))
+XGB_MIN_CHILD_WEIGHT     = int(os.getenv("XGB_MIN_CHILD_WEIGHT",       "5"))
+XGB_EARLY_STOPPING_ROUNDS= int(os.getenv("XGB_EARLY_STOPPING_ROUNDS",  "20"))
+XGB_RANDOM_STATE         = int(os.getenv("XGB_RANDOM_STATE",           "42"))
+
+# ─────────────────────────────────────────────────────────────
+# SEQUENCE MODEL HYPERPARAMETERS (LSTM alarm-sequence classifier)
+# ─────────────────────────────────────────────────────────────
+SEQ_MAX_LEN    = int(os.getenv("SEQ_MAX_LEN",    "20"))
+SEQ_EMBED_DIM  = int(os.getenv("SEQ_EMBED_DIM",  "32"))
+SEQ_HIDDEN_SIZE= int(os.getenv("SEQ_HIDDEN_SIZE","128"))
+SEQ_BATCH_SIZE = int(os.getenv("SEQ_BATCH_SIZE", "256"))
+SEQ_VALID_FRAC = float(os.getenv("SEQ_VALID_FRAC","0.15"))
+SEQ_N_EPOCHS   = int(os.getenv("SEQUENCE_EPOCHS", "5"))
+
+# ─────────────────────────────────────────────────────────────
+# GNN HYPERPARAMETERS (graph convolutional network)
+# ─────────────────────────────────────────────────────────────
+GNN_HIDDEN_DIM  = int(os.getenv("GNN_HIDDEN_DIM",  "64"))
+GNN_BATCH_SIZE  = int(os.getenv("GNN_BATCH_SIZE",  "256"))
+GNN_VAL_FRAC    = float(os.getenv("GNN_VAL_FRAC",  "0.2"))
+GNN_N_EPOCHS    = int(os.getenv("GNN_EPOCHS",       "25"))
+GNN_RANDOM_STATE= int(os.getenv("GNN_RANDOM_STATE", "42"))
+
+# ─────────────────────────────────────────────────────────────
+# ANOMALY DETECTOR HYPERPARAMETERS (Isolation Forest)
+# ─────────────────────────────────────────────────────────────
+ANOMALY_N_ESTIMATORS    = int(os.getenv("ANOMALY_N_ESTIMATORS",    "200"))
+ANOMALY_SYNTHETIC_NES   = int(os.getenv("ANOMALY_SYNTHETIC_NES",   "1000"))
+ANOMALY_SYNTHETIC_HOURS = int(os.getenv("ANOMALY_SYNTHETIC_HOURS", "720"))
+ANOMALY_INJECTION_RATE  = float(os.getenv("ANOMALY_INJECTION_RATE","0.05"))
+
+# ─────────────────────────────────────────────────────────────
+# INCREMENTAL RETRAINING THRESHOLDS
+# ─────────────────────────────────────────────────────────────
+# Retrain when at least this many new alarms have arrived since the last run
+RETRAIN_NEW_ALARM_THRESHOLD  = int(os.getenv("RETRAIN_NEW_ALARM_THRESHOLD",   "100"))
+# New ONNX file must be at least this fraction of the current deployed size
+RETRAIN_MODEL_SIZE_MIN_RATIO = float(os.getenv("RETRAIN_MODEL_SIZE_MIN_RATIO","0.5"))
+# Maximum allowed accuracy drop before refusing to deploy the new model
+RETRAIN_ACCURACY_TOLERANCE   = float(os.getenv("RETRAIN_ACCURACY_TOLERANCE",  "0.02"))
+
+# ─────────────────────────────────────────────────────────────
+# SYNTHETIC DATA PARAMETERS
+# ─────────────────────────────────────────────────────────────
+SYNTHETIC_N_SAMPLES  = int(os.getenv("SYNTHETIC_N_SAMPLES",  "50000"))
+SYNTHETIC_MIN_SAMPLES= int(os.getenv("SYNTHETIC_MIN_SAMPLES","100"))
 
 # ─────────────────────────────────────────────────────────────
 # ENSURE DIRECTORIES EXIST

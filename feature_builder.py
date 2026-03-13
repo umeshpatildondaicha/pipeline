@@ -19,7 +19,12 @@ import logging
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import configure_logging, OUTPUT_DIR, MODELS_DIR
+from config import (
+    configure_logging, OUTPUT_DIR, MODELS_DIR,
+    BETWEENNESS_SAMPLE_K, MAX_HIERARCHY_DEPTH, TOPO_LAYER_THRESHOLDS,
+    LINK_HEALTH_UTILIZATION_WEIGHT, LINK_HEALTH_ERROR_WEIGHT,
+    LINK_HEALTH_DROP_WEIGHT, LINK_HEALTH_CRITICAL_WEIGHT,
+)
 
 log = configure_logging("feature_builder")
 DATA_DIR = OUTPUT_DIR
@@ -114,7 +119,7 @@ def build_graph_features(ne_df: pd.DataFrame,
 
     # Betweenness centrality — expensive for huge graphs, use approximation
     n_nodes = G.number_of_nodes()
-    k_sample = min(500, n_nodes)  # sample 500 nodes for approximation
+    k_sample = min(BETWEENNESS_SAMPLE_K, n_nodes)
     log.info(f"  Computing betweenness centrality (k={k_sample})...")
     betweenness = nx.betweenness_centrality(G, k=k_sample, normalized=True)
 
@@ -140,12 +145,13 @@ def build_graph_features(ne_df: pd.DataFrame,
     graph_features['IS_LEAF']      = (graph_features['GRAPH_DEGREE'] == 1).astype(int)
     graph_features['IS_ISOLATED']  = (graph_features['GRAPH_DEGREE'] == 0).astype(int)
 
-    # ── Topology layer inference from degree
-    # Core nodes have high degree + high betweenness
+    # ── Topology layer inference from degree using configurable thresholds.
+    # Labels: 0=isolated, 1=access, 2=aggregation, 3=core
+    t = TOPO_LAYER_THRESHOLDS  # e.g. [1, 5, 15]
     graph_features['TOPO_LAYER'] = pd.cut(
         graph_features['GRAPH_DEGREE'],
-        bins=[-1, 1, 5, 15, 9999],
-        labels=[0, 1, 2, 3]  # isolated, access, aggregation, core
+        bins=[-1, t[0], t[1], t[2], 9_999_999],
+        labels=[0, 1, 2, 3]
     ).astype(int)
 
     log.info(f"  Graph features built for {len(graph_features):,} nodes")
@@ -198,13 +204,20 @@ def build_isis_health_features(links_df: pd.DataFrame) -> pd.DataFrame:
     isis_features = src_agg.merge(dst_agg, on='ID', how='outer')
     isis_features = isis_features.fillna(0)
 
-    # ── Combined health score (0=healthy, higher=worse)
+    # ── Combined health score in [0, 1] range (0=healthy, 1=worst).
+    # Each component is normalised to 0–1 before weighting so that the
+    # final score is also bounded and the weights are comparable:
+    #   utilization  : percent (0-100) → divide by 100
+    #   error_rate   : already a fraction (0–1)
+    #   drop_rate    : already a fraction (0–1)
+    #   critical_links: count → divide by total link count (clamped to 1)
+    link_count = isis_features['SRC_LINK_COUNT'].replace(0, 1)
     isis_features['LINK_HEALTH_SCORE'] = (
-        isis_features['SRC_MAX_UTILIZATION'] * 10 +
-        isis_features['SRC_MAX_ERROR_RATE']  * 100 +
-        isis_features['SRC_MAX_DROP_RATE']   * 100 +
-        isis_features['SRC_CRITICAL_LINKS']  * 5
-    )
+        (isis_features['SRC_MAX_UTILIZATION'] / 100.0) * LINK_HEALTH_UTILIZATION_WEIGHT +
+        isis_features['SRC_MAX_ERROR_RATE']             * LINK_HEALTH_ERROR_WEIGHT       +
+        isis_features['SRC_MAX_DROP_RATE']              * LINK_HEALTH_DROP_WEIGHT        +
+        (isis_features['SRC_CRITICAL_LINKS'] / link_count) * LINK_HEALTH_CRITICAL_WEIGHT
+    ).clip(0, 1)
 
     log.info(f"  ISIS health features for {len(isis_features):,} NEs")
     return isis_features
@@ -231,7 +244,7 @@ def build_hierarchy_features(ne_df: pd.DataFrame) -> pd.DataFrame:
     def get_depth(ne_id, depth=0, visited=None):
         if visited is None:
             visited = set()
-        if ne_id in visited or depth > 20:  # prevent cycles
+        if ne_id in visited or depth > MAX_HIERARCHY_DEPTH:  # prevent cycles
             return depth
         visited.add(ne_id)
         parent = parent_map.get(ne_id)

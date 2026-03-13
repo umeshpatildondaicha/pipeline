@@ -30,7 +30,13 @@ from onnxmltools import convert_xgboost
 from onnxmltools.convert.common.data_types import FloatTensorType
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import configure_logging, OUTPUT_DIR, MODELS_DIR
+from config import (
+    configure_logging, OUTPUT_DIR, MODELS_DIR,
+    XGB_N_ESTIMATORS, XGB_MAX_DEPTH, XGB_LEARNING_RATE,
+    XGB_SUBSAMPLE, XGB_COLSAMPLE_BYTREE, XGB_MIN_CHILD_WEIGHT,
+    XGB_EARLY_STOPPING_ROUNDS, XGB_RANDOM_STATE,
+    SYNTHETIC_N_SAMPLES, SYNTHETIC_MIN_SAMPLES,
+)
 
 log = configure_logging("train_root_cause")
 DATA_DIR = OUTPUT_DIR
@@ -154,8 +160,11 @@ def prepare_training_data(master_df: pd.DataFrame,
     training = training.dropna(subset=[TARGET_COL])
     log.info(f"Training samples with labels: {len(training):,}")
 
-    if len(training) < 100:
-        log.warning(f"Only {len(training)} labelled samples — adding synthetic data to reach 50k")
+    if len(training) < SYNTHETIC_MIN_SAMPLES:
+        log.warning(
+            f"Only {len(training)} labelled samples — adding synthetic data "
+            f"(SYNTHETIC_N_SAMPLES={SYNTHETIC_N_SAMPLES})"
+        )
         synthetic = _generate_synthetic_training_data(master_df)
         training = pd.concat([training, synthetic], ignore_index=True)
 
@@ -163,7 +172,9 @@ def prepare_training_data(master_df: pd.DataFrame,
 
 
 def _generate_synthetic_training_data(master_df: pd.DataFrame,
-                                       n_samples: int = 50000) -> pd.DataFrame:
+                                       n_samples: int = None) -> pd.DataFrame:
+    if n_samples is None:
+        n_samples = SYNTHETIC_N_SAMPLES
     """
     Generate synthetic training data from NE features.
     USE THIS ONLY until you connect your real alarm history.
@@ -342,23 +353,23 @@ def train_root_cause_classifier(training_df: pd.DataFrame) -> dict:
 
     # ── Train/test split (stratified)
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
+        X, y, test_size=0.2, random_state=XGB_RANDOM_STATE, stratify=y
     )
     log.info(f"Train: {len(X_train):,}  Test: {len(X_test):,}")
 
-    # ── XGBoost model
+    # ── XGBoost model — hyperparameters loaded from config / environment
     model = xgb.XGBClassifier(
-        n_estimators      = 300,
-        max_depth         = 8,
-        learning_rate     = 0.05,
-        subsample         = 0.8,
-        colsample_bytree  = 0.8,
-        min_child_weight  = 5,
-        eval_metric       = 'mlogloss',
-        early_stopping_rounds = 20,
-        random_state      = 42,
-        n_jobs            = -1,
-        tree_method       = 'hist',
+        n_estimators          = XGB_N_ESTIMATORS,
+        max_depth             = XGB_MAX_DEPTH,
+        learning_rate         = XGB_LEARNING_RATE,
+        subsample             = XGB_SUBSAMPLE,
+        colsample_bytree      = XGB_COLSAMPLE_BYTREE,
+        min_child_weight      = XGB_MIN_CHILD_WEIGHT,
+        eval_metric           = 'mlogloss',
+        early_stopping_rounds = XGB_EARLY_STOPPING_ROUNDS,
+        random_state          = XGB_RANDOM_STATE,
+        n_jobs                = -1,
+        tree_method           = 'hist',
     )
 
     log.info("Training XGBoost model...")

@@ -138,10 +138,23 @@ def load_alarm_schema() -> dict:
     return _fallback_mapping(ALARM_COLS["table"])
 
 
-def get_alarm_query(schema: dict, since_timestamp: str = None) -> str:
+def get_alarm_query(schema: dict, since_timestamp: str = None) -> tuple:
     """
     Build the SELECT query for alarms using the detected column names.
     Fetches the columns we need for training.
+
+    Returns
+    -------
+    (sql, params) where:
+      sql    — query string with a ':since_ts' bind-parameter when
+               since_timestamp is provided (use with pd.read_sql params=)
+      params — dict to pass as the `params` argument to pd.read_sql /
+               SQLAlchemy execute; empty dict when since_timestamp is None.
+
+    Column identifiers come from schema-detection output (trusted internal
+    data), so they are safe to interpolate into the SQL template.  Only the
+    *value* of since_timestamp is bound via a parameterised placeholder to
+    avoid any risk of injection.
     """
     t   = schema["table"]
     ne  = schema.get("ne_id",      "NE_ID_FK")
@@ -168,20 +181,23 @@ def get_alarm_query(schema: dict, since_timestamp: str = None) -> str:
     if dom:
         select_cols.append(f"{dom} AS domain")
 
-    where_clauses = []
+    params: dict = {}
     if since_timestamp:
-        where_clauses.append(f"{ts} > '{since_timestamp}'")
+        where = f"WHERE {ts} > :since_ts"
+        params["since_ts"] = since_timestamp
+    else:
+        where = ""
 
-    where = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
-    cols  = ",\n       ".join(select_cols)
+    cols = ",\n       ".join(select_cols)
 
-    return f"""
+    sql = f"""
         SELECT
                {cols}
         FROM   {t}
         {where}
         ORDER BY {ts}
     """
+    return sql, params
 
 
 def _find_column(actual_cols_upper: list, aliases: list) -> str:
@@ -247,4 +263,5 @@ if __name__ == "__main__":
             print(f"    {k:<15} → {v}")
 
     print("\n  Sample query:")
-    print(get_alarm_query(schema))
+    sample_sql, _ = get_alarm_query(schema)
+    print(sample_sql)

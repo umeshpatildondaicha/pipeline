@@ -27,7 +27,11 @@ from skl2onnx.common.data_types import FloatTensorType
 from sklearn.pipeline import Pipeline
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import configure_logging, OUTPUT_DIR, MODELS_DIR
+from config import (
+    configure_logging, OUTPUT_DIR, MODELS_DIR,
+    ANOMALY_N_ESTIMATORS, ANOMALY_SYNTHETIC_NES, ANOMALY_SYNTHETIC_HOURS,
+    ANOMALY_INJECTION_RATE,
+)
 
 log = configure_logging("train_anomaly")
 DATA_DIR = OUTPUT_DIR
@@ -60,8 +64,12 @@ KPI_WINDOW_FEATURES = [
 ]
 
 
-def generate_synthetic_kpi_data(n_nes: int = 1000,
-                                  n_hours: int = 720) -> pd.DataFrame:
+def generate_synthetic_kpi_data(n_nes: int = None,
+                                  n_hours: int = None) -> pd.DataFrame:
+    if n_nes is None:
+        n_nes = ANOMALY_SYNTHETIC_NES
+    if n_hours is None:
+        n_hours = ANOMALY_SYNTHETIC_HOURS
     """
     Generate synthetic KPI time series (720 hours = 30 days per NE).
     Includes normal traffic patterns + injected anomalies.
@@ -97,8 +105,8 @@ def generate_synthetic_kpi_data(n_nes: int = 1000,
             kpi_value = baseline * traffic_factor + np.random.normal(0, noise_level)
             is_anomaly = 0
 
-            # Inject anomalies (~5% of time)
-            if np.random.random() < 0.05:
+            # Inject anomalies (rate controlled by ANOMALY_INJECTION_RATE)
+            if np.random.random() < ANOMALY_INJECTION_RATE:
                 anomaly_type = np.random.choice(['spike', 'drop', 'drift'])
                 if anomaly_type == 'spike':
                     kpi_value *= np.random.uniform(2.0, 5.0)
@@ -224,7 +232,7 @@ def train_anomaly_detector(features_df: pd.DataFrame) -> dict:
     pipeline = Pipeline([
         ('scaler', StandardScaler()),
         ('model', IsolationForest(
-            n_estimators  = 200,
+            n_estimators  = ANOMALY_N_ESTIMATORS,
             contamination = contamination,
             max_samples   = 'auto',
             random_state  = 42,

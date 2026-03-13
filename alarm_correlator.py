@@ -21,12 +21,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pandas as pd
 import numpy as np
 
-from config import configure_logging, OUTPUT_DIR
+from config import configure_logging, OUTPUT_DIR, CORRELATION_WINDOW_MINUTES
 
 log = configure_logging("alarm_correlator")
 
 DATA_DIR = OUTPUT_DIR
-WINDOW_MINUTES = 30
+WINDOW_MINUTES = CORRELATION_WINDOW_MINUTES
 
 
 def _build_entity_neighbours(ne_df: pd.DataFrame, links_df: pd.DataFrame):

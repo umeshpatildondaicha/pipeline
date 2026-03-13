@@ -25,8 +25,32 @@ import java.util.concurrent.atomic.AtomicReference;
 @Service
 public class NocInferenceService {
 
-    @Value("${noc.models.deploy-dir:/models/deploy}")
+    /**
+     * Directory where Python pipeline writes trained ONNX models and manifest.json.
+     * Must be set to a real path in application.properties / environment.
+     * There is intentionally no absolute-path default — the application will fail
+     * fast at startup rather than silently looking in a non-existent location.
+     *
+     * Example application.properties entry:
+     *   noc.models.deploy-dir=${user.home}/noc-pipeline/data/models/deploy
+     */
+    @Value("${noc.models.deploy-dir}")
     private String deployDir;
+
+    /**
+     * How often (ms) the watcher checks manifest.json for a new model version.
+     * Default: 10 seconds.  Override via noc.models.watcher-interval-ms.
+     */
+    @Value("${noc.models.watcher-interval-ms:10000}")
+    private long watcherIntervalMs;
+
+    /**
+     * Minimum confidence threshold for propagation rule predictions.
+     * Rules with confidence below this value are filtered out.
+     * Default: 0.3.  Override via noc.models.min-propagation-confidence.
+     */
+    @Value("${noc.models.min-propagation-confidence:0.3}")
+    private double minPropagationConfidence;
 
     // ── Model sessions (atomic references for hot-swap)
     private final AtomicReference<OrtSession> rootCauseSession   = new AtomicReference<>();
@@ -146,7 +170,7 @@ public class NocInferenceService {
     // ─────────────────────────────────────────────────────────────
     // MODEL WATCHER — detects new ONNX files every 10 seconds
     // ─────────────────────────────────────────────────────────────
-    @Scheduled(fixedDelay = 10_000)
+    @Scheduled(fixedDelayString = "${noc.models.watcher-interval-ms:10000}")
     public void checkForModelUpdates() {
         try {
             Path manifestPath = Paths.get(deployDir, "manifest.json");
@@ -301,7 +325,7 @@ public class NocInferenceService {
 
         for (Map<String, Object> rule : consequents) {
             double confidence = ((Number) rule.get("confidence")).doubleValue();
-            if (confidence < 0.3) continue;  // skip low confidence
+            if (confidence < minPropagationConfidence) continue;
 
             Number avgDelayNum = (Number) rule.get("avg_delay_sec");
 
@@ -399,7 +423,7 @@ public class NocInferenceService {
     }
 
     private void startModelWatcher() {
-        log.info("Model watcher started — checking every 10s for updates");
+        log.info("Model watcher started — checking every {}ms for updates", watcherIntervalMs);
     }
 }
 
