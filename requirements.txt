@@ -1,0 +1,32 @@
+# NOC ML Training Pipeline
+# Built for: NETWORK_ELEMENT, NETWORK_INVENTORY, BGP/LLDP/OSPF/ISIS/PHYSICAL links,
+#            KPI_COUNTER, KPI_FORMULA tables
+
+# ─────────────────────────────────────────────
+# Python dependencies
+# ─────────────────────────────────────────────
+pandas>=2.0.0
+numpy>=1.24.0
+sqlalchemy>=2.0.0
+pymysql>=1.1.0
+
+# ML models
+xgboost>=2.0.0
+scikit-learn>=1.3.0
+scikit-learn-extra>=0.3.0
+
+# Graph analysis
+networkx>=3.1
+
+# ONNX export
+onnxmltools>=1.12.0
+skl2onnx>=1.15.0
+onnxruntime>=1.16.0
+
+# Sequence model (LSTM) and ONNX export
+torch>=2.0.0
+onnxscript>=0.2.0
+
+# Utilities
+tqdm>=4.65.0
+python-dotenv>=1.0.0
