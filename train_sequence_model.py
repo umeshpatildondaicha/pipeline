@@ -20,12 +20,12 @@ import pandas as pd
 from config import (
     configure_logging, OUTPUT_DIR, MODELS_DIR, DEPLOY_DIR,
     SEQ_MAX_LEN, SEQ_EMBED_DIM, SEQ_HIDDEN_SIZE, SEQ_BATCH_SIZE,
-    SEQ_VALID_FRAC, SEQ_N_EPOCHS, XGB_RANDOM_STATE,
+    SEQ_VALID_FRAC, SEQ_N_EPOCHS, XGB_RANDOM_STATE, SEQ_MAX_TRAIN_SAMPLES,
 )
 
 log = configure_logging("train_sequence_model")
 
-DATA_DIR = OUTPUT_DIR
+DATA_DIR     = OUTPUT_DIR
 MAX_SEQ_LEN  = SEQ_MAX_LEN
 EMBED_DIM    = SEQ_EMBED_DIM
 HIDDEN_SIZE  = SEQ_HIDDEN_SIZE
@@ -135,7 +135,13 @@ def train_and_export(
             out = self.fc(h_n.squeeze(0))
             return out
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    log.info("Training device: %s", device)
     model = SequenceRootCauseLSTM(
         vocab_size=vocab_size,
         embed_dim=EMBED_DIM,
@@ -230,6 +236,13 @@ def run():
     if incidents_df.empty or "alarm_sequence" not in incidents_df.columns:
         log.error("No incidents or missing alarm_sequence. Run alarm_correlator.py first.")
         return
+
+    if SEQ_MAX_TRAIN_SAMPLES > 0 and len(incidents_df) > SEQ_MAX_TRAIN_SAMPLES:
+        log.info(
+            "Capping incidents: %d → %d (SEQ_MAX_TRAIN_SAMPLES=%d)",
+            len(incidents_df), SEQ_MAX_TRAIN_SAMPLES, SEQ_MAX_TRAIN_SAMPLES,
+        )
+        incidents_df = incidents_df.sample(SEQ_MAX_TRAIN_SAMPLES, random_state=RANDOM_STATE).reset_index(drop=True)
 
     label_list = _load_root_cause_labels()
     code_to_idx = build_vocab(incidents_df)

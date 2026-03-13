@@ -18,9 +18,9 @@ Environment variable reference (all optional unless marked REQUIRED):
   XGB_COLSAMPLE_BYTREE, XGB_MIN_CHILD_WEIGHT, XGB_EARLY_STOPPING_ROUNDS,
   XGB_RANDOM_STATE
   SEQ_MAX_LEN, SEQ_EMBED_DIM, SEQ_HIDDEN_SIZE, SEQ_BATCH_SIZE,
-  SEQ_VALID_FRAC, SEQUENCE_EPOCHS
+  SEQ_VALID_FRAC, SEQUENCE_EPOCHS, SEQ_MAX_TRAIN_SAMPLES
   GNN_HIDDEN_DIM, GNN_BATCH_SIZE, GNN_VAL_FRAC, GNN_RANDOM_STATE,
-  GNN_EPOCHS
+  GNN_EPOCHS, GNN_MAX_NODES
   ANOMALY_N_ESTIMATORS, ANOMALY_SYNTHETIC_NES, ANOMALY_SYNTHETIC_HOURS,
   ANOMALY_INJECTION_RATE
   RETRAIN_NEW_ALARM_THRESHOLD, RETRAIN_MODEL_SIZE_MIN_RATIO,
@@ -139,12 +139,14 @@ XGB_RANDOM_STATE         = int(os.getenv("XGB_RANDOM_STATE",           "42"))
 # ─────────────────────────────────────────────────────────────
 # SEQUENCE MODEL HYPERPARAMETERS (LSTM alarm-sequence classifier)
 # ─────────────────────────────────────────────────────────────
-SEQ_MAX_LEN    = int(os.getenv("SEQ_MAX_LEN",    "20"))
-SEQ_EMBED_DIM  = int(os.getenv("SEQ_EMBED_DIM",  "32"))
-SEQ_HIDDEN_SIZE= int(os.getenv("SEQ_HIDDEN_SIZE","128"))
-SEQ_BATCH_SIZE = int(os.getenv("SEQ_BATCH_SIZE", "256"))
-SEQ_VALID_FRAC = float(os.getenv("SEQ_VALID_FRAC","0.15"))
-SEQ_N_EPOCHS   = int(os.getenv("SEQUENCE_EPOCHS", "5"))
+SEQ_MAX_LEN         = int(os.getenv("SEQ_MAX_LEN",          "20"))
+SEQ_EMBED_DIM       = int(os.getenv("SEQ_EMBED_DIM",        "32"))
+SEQ_HIDDEN_SIZE     = int(os.getenv("SEQ_HIDDEN_SIZE",      "64"))
+SEQ_BATCH_SIZE      = int(os.getenv("SEQ_BATCH_SIZE",       "64"))
+SEQ_VALID_FRAC      = float(os.getenv("SEQ_VALID_FRAC",     "0.15"))
+SEQ_N_EPOCHS        = int(os.getenv("SEQUENCE_EPOCHS",      "3"))
+# Cap training samples to limit RAM usage on constrained machines (0 = no cap)
+SEQ_MAX_TRAIN_SAMPLES = int(os.getenv("SEQ_MAX_TRAIN_SAMPLES", "3000"))
 
 # ─────────────────────────────────────────────────────────────
 # GNN HYPERPARAMETERS (graph convolutional network)
@@ -152,8 +154,10 @@ SEQ_N_EPOCHS   = int(os.getenv("SEQUENCE_EPOCHS", "5"))
 GNN_HIDDEN_DIM  = int(os.getenv("GNN_HIDDEN_DIM",  "64"))
 GNN_BATCH_SIZE  = int(os.getenv("GNN_BATCH_SIZE",  "256"))
 GNN_VAL_FRAC    = float(os.getenv("GNN_VAL_FRAC",  "0.2"))
-GNN_N_EPOCHS    = int(os.getenv("GNN_EPOCHS",       "25"))
+GNN_N_EPOCHS    = int(os.getenv("GNN_EPOCHS",       "10"))
 GNN_RANDOM_STATE= int(os.getenv("GNN_RANDOM_STATE", "42"))
+# Cap node count for GNN adjacency matrix to limit RAM (0 = no cap)
+GNN_MAX_NODES   = int(os.getenv("GNN_MAX_NODES",    "5000"))
 
 # ─────────────────────────────────────────────────────────────
 # ANOMALY DETECTOR HYPERPARAMETERS (Isolation Forest)

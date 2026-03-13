@@ -23,6 +23,7 @@ import torch
 from config import (
     configure_logging, OUTPUT_DIR, MODELS_DIR,
     GNN_HIDDEN_DIM, GNN_N_EPOCHS, GNN_BATCH_SIZE, GNN_VAL_FRAC, GNN_RANDOM_STATE,
+    GNN_MAX_NODES,
 )
 
 log = configure_logging("train_gnn_model")
@@ -74,6 +75,11 @@ def load_graph_and_features():
     master = pd.read_pickle(master_path)
     ne_df = pd.read_pickle(ne_path) if os.path.exists(ne_path) else master
     links_df = pd.read_pickle(links_path) if os.path.exists(links_path) else pd.DataFrame(columns=["src", "dst"])
+
+    # Cap node count to avoid O(n²) adjacency matrix blowing up RAM
+    if GNN_MAX_NODES > 0 and len(master) > GNN_MAX_NODES:
+        log.info("Capping GNN nodes: %d → %d (GNN_MAX_NODES=%d)", len(master), GNN_MAX_NODES, GNN_MAX_NODES)
+        master = master.sample(GNN_MAX_NODES, random_state=42).reset_index(drop=True)
 
     # Node index: 0 .. n-1 by master row order (ID column)
     if "ID" not in master.columns:
