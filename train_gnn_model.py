@@ -165,15 +165,24 @@ def build_node_labels(alarms_path: str, id_to_idx: dict, ne_df: pd.DataFrame, la
 
 
 def build_adjacency(n_nodes: int, edge_list: list):
-    """Normalized adjacency with self-loops: D^{-1/2} (A + I) D^{-1/2}."""
-    A = np.zeros((n_nodes, n_nodes), dtype=np.float32)
-    for i, j in edge_list:
-        A[i, j] = 1.0
-    A = A + np.eye(n_nodes, dtype=np.float32)
-    D = A.sum(axis=1)
-    D_inv_sqrt = np.power(D + 1e-6, -0.5)
-    A_norm = (D_inv_sqrt[:, None] * A * D_inv_sqrt[None, :]).astype(np.float32)
-    return torch.from_numpy(A_norm)
+    """Normalized adjacency D^{-1/2}(A+I)D^{-1/2} as a sparse COO tensor.
+
+    Sparse representation avoids allocating an n×n dense matrix — critical
+    when n is in the thousands but the graph has only a few hundred edges.
+    """
+    # Include self-loops
+    all_edges = list(edge_list) + [(i, i) for i in range(n_nodes)]
+    rows = np.array([e[0] for e in all_edges], dtype=np.int64)
+    cols = np.array([e[1] for e in all_edges], dtype=np.int64)
+
+    # Degree = number of non-zero entries per row
+    degree = np.bincount(rows, minlength=n_nodes).astype(np.float32)
+    d_inv_sqrt = np.power(degree + 1e-6, -0.5)
+    vals = (d_inv_sqrt[rows] * d_inv_sqrt[cols]).astype(np.float32)
+
+    indices = torch.tensor(np.stack([rows, cols]), dtype=torch.long)
+    values  = torch.tensor(vals, dtype=torch.float32)
+    return torch.sparse_coo_tensor(indices, values, (n_nodes, n_nodes)).coalesce()
 
 
 class GCN(torch.nn.Module):
@@ -184,8 +193,8 @@ class GCN(torch.nn.Module):
 
     def forward(self, x, adj):
         # Simplified GCN: H1 = relu(adj @ x @ W1), H2 = adj @ H1 @ W2
-        h = torch.relu(adj @ self.conv1(x))
-        out = adj @ self.conv2(h)
+        h = torch.relu(torch.sparse.mm(adj, self.conv1(x)))
+        out = torch.sparse.mm(adj, self.conv2(h))
         return out
 
 
@@ -213,6 +222,7 @@ def train_and_save(data: dict, y: np.ndarray, label_list: list):
     log.info(f"GNN split: {train_mask.sum()} train nodes, {val_mask.sum()} val nodes")
 
     adj = build_adjacency(n_nodes, edge_list)
+    # Sparse tensors don't support MPS yet — always use CUDA or CPU for GNN
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     x_t   = torch.from_numpy(X).to(device)
     adj   = adj.to(device)

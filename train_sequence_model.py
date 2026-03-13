@@ -215,7 +215,7 @@ def train_and_export(
         input_names=["alarm_sequence"],
         output_names=["logits"],
         dynamic_axes={"alarm_sequence": {0: "batch"}, "logits": {0: "batch"}},
-        opset_version=14,
+        opset_version=17,
     )
     log.info(f"ONNX saved: {onnx_path}")
 
